@@ -54,11 +54,12 @@ local function writeQueue(queue)
         local chapter_id = tostring(entry.chapter_id or "")
         if chapter_id ~= "" then
             lines[#lines + 1] = string.format(
-                "  { chapter_id = %q, manga_id = %q, last_page = %d, is_read = %s, stage = %q, timestamp = %d },",
+                "  { chapter_id = %q, manga_id = %q, last_page = %d, is_read = %s, sync_trackers_always = %s, stage = %q, timestamp = %d },",
                 chapter_id,
                 tostring(entry.manga_id or ""),
                 math.floor(tonumber(entry.last_page) or 0),
                 entry.is_read == true and "true" or "false",
+                entry.sync_trackers_always == true and "true" or "false",
                 tostring(entry.stage or "chapter"),
                 math.floor(tonumber(entry.timestamp) or 0)
             )
@@ -77,7 +78,7 @@ local function writeQueue(queue)
     return os.rename(tmp_path, QUEUE_FILE) ~= nil
 end
 
--- entry : { chapter_id, manga_id?, last_page, is_read, stage?, timestamp }
+-- entry : { chapter_id, manga_id?, last_page, is_read, sync_trackers_always?, stage?, timestamp }
 function SyncQueue.enqueue(entry)
     if type(entry) ~= "table" then
         return false
@@ -86,6 +87,9 @@ function SyncQueue.enqueue(entry)
     if chapter_id == "" then
         return false
     end
+
+    -- Normalize so retry always sees an explicit boolean.
+    entry.sync_trackers_always = entry.sync_trackers_always == true
 
     local queue = readQueue()
     for i, existing in ipairs(queue) do
