@@ -1,17 +1,10 @@
 -- Boundary: MangaSync KOReader plugin entry point.
 --
--- Responsibility: hook into KOReader's reader lifecycle to detect when a
--- suwayomiplus-downloaded manga CBZ is closed, then sync reading progress
--- back to the Suwayomi server.  Completely optional — the plugin silently does
--- nothing when suwayomiplus is absent or unconfigured.
+-- Syncs downloaded Suwayomi+ chapter CBZs back to the Suwayomi server:
+--   1) updateChapter (per-chapter isRead / lastPageRead)
+--   2) trackProgress (MAL / AniList / Kitsu / MangaUpdates / …) when manga_id known
 --
--- Event hooks:
---   onReaderReady        — capture document path; retry any queued syncs
---   onPageUpdate(pageno) — track current page number
---   onCloseDocument      — sync progress to Suwayomi; queue on failure
---   addToMainMenu        — add a "MangaSync" entry in the reader/FM menu
---
--- Dependencies: sync_worker, sync_queue (local); suwayomi/settings (optional).
+-- Event hooks: onReaderReady, onPageUpdate, onCloseDocument, addToMainMenu.
 
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local UIManager       = require("ui/uimanager")
@@ -21,27 +14,15 @@ local logger          = require("logger")
 local SyncWorker = require("sync_worker")
 local SyncQueue  = require("sync_queue")
 
--- ---------------------------------------------------------------------------
--- Plugin class
--- ---------------------------------------------------------------------------
-
 local MangaSync = WidgetContainer:extend{
     name        = "mangasync",
     is_doc_only = false,
-
-    -- Reader state, reset on each document open.
     _current_doc_path = nil,
     _current_page     = 0,
 }
 
--- ---------------------------------------------------------------------------
--- Internal helpers
--- ---------------------------------------------------------------------------
-
 local MAX_SDR_BYTES = 64 * 1024
 
--- Lazily load suwayomiplus credentials and download directory.
--- Returns (credentials, download_directory) or (nil, nil) when unavailable.
 local function loadSuwayomiConfig()
     local ok, Settings = pcall(require, "suwayomi/settings")
     if not ok or type(Settings) ~= "table" then
@@ -66,10 +47,7 @@ local function loadSuwayomiConfig()
     return creds, dir
 end
 
--- Read the sdr sidecar that suwayomiplus/manga_metadata.lua writes alongside
--- each downloaded CBZ.  Returns the parsed Lua table or nil.
 local function readSdrMetadata(cbz_path)
-    -- Convention: /path/to/Manga/Ch001.cbz → Ch001.cbz.sdr/metadata.cbz.lua
     local sdr_path = cbz_path .. ".sdr/metadata.cbz.lua"
     local f = io.open(sdr_path, "r")
     if not f then
@@ -80,11 +58,18 @@ local function readSdrMetadata(cbz_path)
     if #content > MAX_SDR_BYTES then
         return nil
     end
-    local loader = loadstring(content)
+    local loader
+    if rawget(_G, "loadstring") then
+        loader = loadstring(content)
+        if loader and rawget(_G, "setfenv") then
+            setfenv(loader, {})
+        end
+    else
+        loader = load(content, "mangasync_sdr", "t", {})
+    end
     if not loader then
         return nil
     end
-    setfenv(loader, {})
     local ok, result = pcall(loader)
     if ok and type(result) == "table" then
         return result
@@ -92,31 +77,34 @@ local function readSdrMetadata(cbz_path)
     return nil
 end
 
--- Return true when cbz_path is inside the suwayomi download directory.
 local function isUnderDownloadDir(cbz_path, download_dir)
     if not cbz_path or not download_dir or download_dir == "" then
         return false
     end
-    -- Normalise: strip trailing slashes from the download dir prefix.
     local prefix = download_dir:gsub("/*$", "")
     if #prefix == 0 then
         return false
     end
-    -- The path must start with prefix followed by a directory separator.
     local next_char = cbz_path:sub(#prefix + 1, #prefix + 1)
     return cbz_path:sub(1, #prefix) == prefix
         and (next_char == "/" or cbz_path == prefix)
 end
 
--- Resolve the current document path from self.ui with multiple fallbacks so
--- the plugin is resilient to KOReader version differences.
+-- KOReader pages are 1-based; Suwayomi lastPageRead is 0-based.
+local function toServerPage(page)
+    page = math.floor(tonumber(page) or 1)
+    if page < 1 then
+        page = 1
+    end
+    return math.max(0, page - 1)
+end
+
 function MangaSync:_resolveDocumentPath()
     local ui = self.ui
     if not ui then
         return self._current_doc_path
     end
-    local path = ui.document_path
-        or ui.document_pathname
+    local path = ui.document_path or ui.document_pathname
     if not path then
         local doc = ui.document
         if type(doc) == "table" then
@@ -126,8 +114,6 @@ function MangaSync:_resolveDocumentPath()
     return path or self._current_doc_path
 end
 
--- Return true when KOReader considers the current document finished (100 % or
--- explicitly marked complete in doc_settings).
 function MangaSync:_isDocumentFinished()
     local ui = self.ui
     if not ui then
@@ -146,9 +132,20 @@ function MangaSync:_isDocumentFinished()
     return percent ~= nil and percent >= 1
 end
 
--- Retry every queued sync that previously failed.  Removes successful entries
--- and re-persists the remainder.  Returns the number of successfully retried
--- entries.
+function MangaSync:_formatTrackerSummary(records)
+    records = records or {}
+    if #records == 0 then
+        return "no bound trackers updated"
+    end
+    local parts = {}
+    for _, rec in ipairs(records) do
+        local name = SyncWorker.trackerName(rec.trackerId or rec.tracker_id)
+        local ch = rec.lastChapterRead or rec.last_chapter_read or "?"
+        parts[#parts + 1] = string.format("%s→%s", name, tostring(ch))
+    end
+    return table.concat(parts, ", ")
+end
+
 function MangaSync:_retryQueuedSyncs(credentials)
     local entries = SyncQueue.getAll()
     if #entries == 0 then
@@ -158,43 +155,45 @@ function MangaSync:_retryQueuedSyncs(credentials)
     local remaining = {}
     local count = 0
     for _, entry in ipairs(entries) do
-        local result = SyncWorker.syncChapter(
-            credentials,
-            entry.chapter_id,
-            entry.is_read,
-            entry.last_page
-        )
-        if result and result.ok then
-            count = count + 1
+        local result
+        if entry.stage == "trackers" and entry.manga_id and entry.manga_id ~= "" then
+            result = SyncWorker.syncTrackers(credentials, entry.manga_id)
+            if result and result.ok then
+                count = count + 1
+            else
+                table.insert(remaining, entry)
+            end
         else
-            table.insert(remaining, entry)
+            result = SyncWorker.syncChapterAndTrackers(credentials, {
+                chapter_id = entry.chapter_id,
+                manga_id = entry.manga_id,
+                is_read = entry.is_read == true,
+                last_page_read = entry.last_page,
+                force_trackers = entry.is_read == true,
+            })
+            if result and result.ok then
+                count = count + 1
+            else
+                entry.stage = result and result.stage or "chapter"
+                table.insert(remaining, entry)
+            end
         end
     end
     SyncQueue.replaceAll(remaining)
     return count
 end
 
--- ---------------------------------------------------------------------------
--- KOReader lifecycle hooks
--- ---------------------------------------------------------------------------
-
 function MangaSync:init()
-    -- Nothing to initialise eagerly; all work is deferred to events.
 end
 
--- onReaderReady fires after the reader has finished setting up the document.
--- We use it to capture the path and attempt any pending retries.
 function MangaSync:onReaderReady()
     self._current_page = 0
-
-    -- Capture path early so onCloseDocument can always find it.
     local path = self:_resolveDocumentPath()
     if path then
         self._current_doc_path = path
     end
 
-    -- Opportunistically retry queued syncs now that we have a network context.
-    local credentials, _ = loadSuwayomiConfig()
+    local credentials = loadSuwayomiConfig()
     if not credentials or not credentials.server_url or credentials.server_url == "" then
         return
     end
@@ -203,16 +202,12 @@ function MangaSync:onReaderReady()
     end)
 end
 
--- Track the current page so we can report it to Suwayomi on close.
 function MangaSync:onPageUpdate(page_no)
     self._current_page = tonumber(page_no) or self._current_page
 end
 
--- onCloseDocument fires just before the reader tears down the document.
 function MangaSync:onCloseDocument()
     local doc_path = self:_resolveDocumentPath()
-
-    -- Only act on CBZ files.
     if not doc_path or not doc_path:match("%.cbz$") then
         self._current_doc_path = nil
         self._current_page = 0
@@ -220,70 +215,85 @@ function MangaSync:onCloseDocument()
     end
 
     local credentials, download_dir = loadSuwayomiConfig()
-
-    -- If suwayomiplus is not configured, or the file is not under the suwayomi
-    -- download directory, do nothing.
-    if not credentials
-        or not download_dir
-        or not isUnderDownloadDir(doc_path, download_dir)
-    then
+    if not credentials or not credentials.server_url or credentials.server_url == "" then
         self._current_doc_path = nil
         self._current_page = 0
         return
     end
 
-    -- Read the sdr sidecar that manga_metadata.lua wrote at download time to
-    -- recover the Suwayomi chapter ID without a server round-trip.
+    -- Prefer download-dir gate when known; still allow sidecar-only if dir missing.
+    if download_dir and not isUnderDownloadDir(doc_path, download_dir) then
+        self._current_doc_path = nil
+        self._current_page = 0
+        return
+    end
+
     local meta = readSdrMetadata(doc_path)
-    local chapter_id = meta and tostring(meta.suwayomi_chapter_id or "")
-    if not chapter_id or chapter_id == "" then
-        -- Chapter was downloaded before the metadata feature; nothing to sync.
+    local chapter_id = meta and tostring(meta.suwayomi_chapter_id or "") or ""
+    local manga_id = meta and tostring(meta.suwayomi_manga_id or "") or ""
+    if chapter_id == "" then
         self._current_doc_path = nil
         self._current_page = 0
         return
     end
 
-    local is_read    = self:_isDocumentFinished()
-    local last_page  = self._current_page or 0
+    local is_read = self:_isDocumentFinished()
+    local last_page = toServerPage(self._current_page or 1)
 
-    -- Sync progress; on any failure, queue for later retry.
     local synced = false
+    local tracker_summary = nil
+    local fail_stage = "chapter"
     pcall(function()
-        local result = SyncWorker.syncChapter(credentials, chapter_id, is_read, last_page)
+        local result = SyncWorker.syncChapterAndTrackers(credentials, {
+            chapter_id = chapter_id,
+            manga_id = manga_id,
+            is_read = is_read,
+            last_page_read = last_page,
+            -- Always attempt trackers when we know the manga; Suwayomi no-ops
+            -- if nothing is bound. Helps keep MU/MAL/AL/Kitsu aligned after
+            -- partial progress too.
+            sync_trackers_always = manga_id ~= "",
+        })
         if result and result.ok then
             synced = true
+            if result.records then
+                tracker_summary = self:_formatTrackerSummary(result.records)
+            elseif result.trackers_skipped then
+                tracker_summary = "trackers skipped"
+            end
+        else
+            fail_stage = result and result.stage or "chapter"
         end
     end)
 
     if synced then
-        -- Brief toast on success (non-blocking).
         pcall(function()
+            local text = "Synced chapter to Suwayomi"
+            if tracker_summary and tracker_summary ~= "trackers skipped" then
+                text = text .. "\nTrackers: " .. tracker_summary
+            end
             UIManager:show(InfoMessage:new{
-                text    = "Synced to Suwayomi \xe2\x9c\x93",
-                timeout = 2,
+                text = text,
+                timeout = 3,
             })
         end)
     else
-        -- Queue for the next time the user opens a chapter.
         pcall(function()
             SyncQueue.enqueue({
                 chapter_id = chapter_id,
-                last_page  = last_page,
-                is_read    = is_read,
-                timestamp  = os.time(),
+                manga_id = manga_id,
+                last_page = last_page,
+                is_read = is_read,
+                stage = fail_stage,
+                timestamp = os.time(),
             })
         end)
-        logger.warn("MangaSync: sync failed for chapter", chapter_id, "— queued for retry.")
+        logger.warn("MangaSync: sync failed for chapter", chapter_id, "stage", fail_stage)
     end
 
-    -- Reset reader state.
     self._current_doc_path = nil
     self._current_page = 0
 end
-
--- ---------------------------------------------------------------------------
--- File manager / reader menu registration
--- ---------------------------------------------------------------------------
 
 function MangaSync:addToMainMenu(menu_items)
     menu_items.mangasync = {
@@ -294,14 +304,50 @@ function MangaSync:addToMainMenu(menu_items)
                 callback = function()
                     UIManager:show(InfoMessage:new{
                         text = table.concat({
-                            "MangaSync automatically syncs your reading",
-                            "progress back to your Suwayomi server whenever",
-                            "you close a downloaded manga chapter.",
+                            "MangaSync syncs downloaded chapter CBZs:",
                             "",
-                            "Requires suwayomiplus to be installed and",
-                            "configured with a valid server URL.",
+                            "1. Per chapter → Suwayomi updateChapter",
+                            "   (isRead + lastPageRead)",
+                            "2. Then trackProgress(mangaId) so bound",
+                            "   MAL / AniList / Kitsu / MangaUpdates",
+                            "   get the latest chapter number.",
+                            "",
+                            "Needs Suwayomi+ metadata sidecars on CBZs.",
+                            "Library 'Updates' fetching stays in Suwayomi+.",
                         }, "\n"),
                     })
+                end,
+            },
+            {
+                text = "Check trackers on server",
+                callback = function()
+                    local credentials = loadSuwayomiConfig()
+                    if not credentials or not credentials.server_url or credentials.server_url == "" then
+                        UIManager:show(InfoMessage:new{
+                            text = "MangaSync: No Suwayomi server configured.",
+                            timeout = 3,
+                        })
+                        return
+                    end
+                    local result = SyncWorker.fetchLoggedInTrackers(credentials)
+                    if not result or not result.ok then
+                        UIManager:show(InfoMessage:new{
+                            text = "MangaSync: Could not reach trackers — "
+                                .. tostring(result and result.error or "error"),
+                            timeout = 4,
+                        })
+                        return
+                    end
+                    local lines = { "Logged-in trackers:" }
+                    if #(result.trackers or {}) == 0 then
+                        lines[#lines + 1] = "(none)"
+                    else
+                        for _, t in ipairs(result.trackers) do
+                            local expired = t.isTokenExpired and " [token expired]" or ""
+                            lines[#lines + 1] = string.format("• %s%s", t.name or "?", expired)
+                        end
+                    end
+                    UIManager:show(InfoMessage:new{ text = table.concat(lines, "\n") })
                 end,
             },
             {
@@ -310,19 +356,16 @@ function MangaSync:addToMainMenu(menu_items)
                     local queued = SyncQueue.getCount()
                     if queued == 0 then
                         UIManager:show(InfoMessage:new{
-                            text    = "MangaSync: No pending syncs.",
+                            text = "MangaSync: No pending syncs.",
                             timeout = 3,
                         })
                         return
                     end
 
-                    local credentials, _ = loadSuwayomiConfig()
-                    if not credentials
-                        or not credentials.server_url
-                        or credentials.server_url == ""
-                    then
+                    local credentials = loadSuwayomiConfig()
+                    if not credentials or not credentials.server_url or credentials.server_url == "" then
                         UIManager:show(InfoMessage:new{
-                            text    = "MangaSync: No Suwayomi server configured.",
+                            text = "MangaSync: No Suwayomi server configured.",
                             timeout = 3,
                         })
                         return
@@ -336,15 +379,15 @@ function MangaSync:addToMainMenu(menu_items)
                     local remaining = SyncQueue.getCount()
                     local msg
                     if count > 0 and remaining == 0 then
-                        msg = string.format("MangaSync: Synced %d chapter(s).", count)
+                        msg = string.format("MangaSync: Synced %d item(s).", count)
                     elseif count > 0 then
                         msg = string.format(
-                            "MangaSync: Synced %d chapter(s); %d still pending.",
+                            "MangaSync: Synced %d; %d still pending.",
                             count, remaining
                         )
                     else
                         msg = string.format(
-                            "MangaSync: Could not sync %d chapter(s) — will retry later.",
+                            "MangaSync: Could not sync %d item(s).",
                             remaining
                         )
                     end
@@ -357,7 +400,7 @@ function MangaSync:addToMainMenu(menu_items)
                     local count = SyncQueue.getCount()
                     SyncQueue.clear()
                     UIManager:show(InfoMessage:new{
-                        text    = string.format("MangaSync: Cleared %d queued sync(s).", count),
+                        text = string.format("MangaSync: Cleared %d queued sync(s).", count),
                         timeout = 3,
                     })
                 end,

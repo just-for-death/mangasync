@@ -1,39 +1,54 @@
 # MangaSync for KOReader
 
-Sync reading progress from **downloaded** Suwayomi+ chapter CBZs back to your [Suwayomi Server](https://github.com/Suwayomi/Suwayomi-Server).
+Syncs **downloaded** Suwayomi+ chapter CBZs back to [Suwayomi Server](https://github.com/Suwayomi/Suwayomi-Server), including **trackers**.
 
 Companion to [Suwayomi+](https://github.com/just-for-death/suwayomiplus) and [MaxOutUI](https://github.com/just-for-death/maxoutui).
 
-Author: [just-for-death](https://github.com/just-for-death)
+Author: [just-for-death](https://github.com/just-for-death) · Version **1.1.0**
 
 ---
 
-## Why this exists
+## Do you need this?
 
-Suwayomi+ already syncs **online stream** progress. When you download chapters as CBZs and open them in KOReader’s native reader, MangaSync closes the gap:
+| How you read | Sync |
+|---|---|
+| Stream / open via Suwayomi+ | Built into Suwayomi+ already |
+| Open downloaded CBZ from file browser / MaxOutUI | **MangaSync** (this plugin) |
 
-1. You finish / leave a chapter CBZ
-2. MangaSync reads `suwayomi_chapter_id` from the `.sdr` sidecar Suwayomi+ wrote
-3. It calls Suwayomi `updateChapter` (progress / read)
-4. Failures go into a persistent retry queue (Tailscale / sleep friendly)
+Keep MangaSync if you often open CBZs outside Suwayomi+.
 
 ---
 
-## Book model (must match Suwayomi+)
+## How each chapter is synced
+
+```text
+Close CBZ
+   │
+   ├─1─ updateChapter(chapterId, { isRead, lastPageRead })
+   │      → Suwayomi DB (this chapter only)
+   │
+   └─2─ trackProgress(mangaId)
+          → Suwayomi pushes lastChapterRead to every
+            bound + logged-in tracker for that manga:
+              MyAnimeList, AniList, Kitsu, MangaUpdates, …
+```
+
+1. **Per chapter** — one GraphQL `updateChapter` for that CBZ’s `suwayomi_chapter_id` from the `.sdr` sidecar.
+2. **Trackers** — one `trackProgress(mangaId)` using `suwayomi_manga_id`. Suwayomi computes the highest read chapter and updates MAL / AniList / Kitsu / MangaUpdates (and any other bound tracker). MangaSync does **not** talk to AniList/MAL directly.
+
+**Library “Updates”** (new chapters from sources) stay in Suwayomi+ / the server — MangaSync does not fetch source updates.
+
+---
+
+## Book layout (from Suwayomi+)
 
 ```text
 Books/Manga/<Source>/<Manga Title>/
   Ch. 001 - Name [id-…].cbz
-  Ch. 001 - Name [id-…].cbz.sdr/metadata.cbz.lua   ← MangaSync reads this
+  Ch. 001 - Name [id-…].cbz.sdr/metadata.cbz.lua
 ```
 
-Sidecar fields used:
-
-- `suwayomi_chapter_id`
-- `suwayomi_manga_id`
-- `doc_props.series` / `title` / `series_index` (display only)
-
-Only files under the Suwayomi+ download directory are synced.
+Sidecar must include `suwayomi_chapter_id` and `suwayomi_manga_id`.
 
 ---
 
@@ -43,18 +58,19 @@ Only files under the Suwayomi+ download directory are synced.
 <koreader-root>/plugins/mangasync.koplugin/
 ```
 
-Needs Suwayomi+ configured (same server credentials / download dir). Restart KOReader.
+Uses Suwayomi+ settings (`server_url`, download dir). Restart KOReader.
 
-Menu: **MangaSync** → About / Retry queued / Clear queue.
+Menu → **MangaSync**:
+- Check trackers on server
+- Retry failed syncs
+- Clear queue
 
 ---
 
-## Behavior
+## Live test (against your Docker Suwayomi)
 
-| Event | Action |
-|---|---|
-| `onReaderReady` | Remember path; retry queue |
-| `onPageUpdate` | Track page |
-| `onCloseDocument` | Sync or enqueue |
+```bash
+python3 tests/live_sync_test.py http://127.0.0.1:4567
+```
 
-Silent no-op if Suwayomi+ / credentials / sidecar are missing. Never crashes the reader.
+Verifies chapter mutation shape, logged-in trackers, and `trackProgress` for bound manga.
